@@ -1,0 +1,164 @@
+import torch
+from torch import nn
+import math
+
+from .augmentations import GaussianSmoothing
+
+
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
+
+
+class GRUDecoder(nn.Module):
+    def __init__(
+        self,
+        neural_dim,
+        n_classes,
+        hidden_dim,
+        layer_dim,
+        nDays=24,
+        dropout=0,
+        device="cuda",
+        strideLen=4,
+        kernelLen=14,
+        gaussianSmoothWidth=0,
+        bidirectional=False,
+    ):
+        super(GRUDecoder, self).__init__()
+
+        # Defining the number of layers and the nodes in each layer
+        self.layer_dim = layer_dim
+        self.hidden_dim = hidden_dim
+        self.neural_dim = neural_dim
+        self.n_classes = n_classes
+        self.nDays = nDays
+        self.device = device
+        self.dropout = dropout
+        self.strideLen = strideLen
+        self.kernelLen = kernelLen
+        self.gaussianSmoothWidth = gaussianSmoothWidth
+        self.bidirectional = bidirectional
+        self.inputLayerNonlinearity = torch.nn.Softsign()
+        #self.inputLayerNonlinearity = torch.nn.GELU()
+        self.unfolder = torch.nn.Unfold(
+            (self.kernelLen, 1), dilation=1, padding=0, stride=self.strideLen
+        )
+        self.gaussianSmoother = GaussianSmoothing(
+            neural_dim, 20, self.gaussianSmoothWidth, dim=1
+        )
+        self.dayWeights = torch.nn.Parameter(torch.randn(nDays, neural_dim, neural_dim))
+        self.dayBias = torch.nn.Parameter(torch.zeros(nDays, 1, neural_dim))
+
+        for x in range(nDays):
+            self.dayWeights.data[x, :, :] = torch.eye(neural_dim)
+
+        # GRU layers
+        self.gru_decoder = nn.GRU(
+            (neural_dim) * self.kernelLen,
+            hidden_dim,
+            layer_dim,
+            batch_first=True,
+            dropout=self.dropout,
+            bidirectional=self.bidirectional,
+        )
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout = self.dropout)
+        
+        self.transformer_encoder = nn.TransformerEncoderLayer(hidden_dim, nhead = 8,
+                                                              #dim_feedforward=hidden_dim,
+                                                              #dropout=self.dropout,
+                                                             #batch_first = True)
+        #self.transformer_encoder2 = nn.TransformerEncoderLayer(hidden_dim, nhead = 8,
+                                                              #dim_feedforward=hidden_dim,
+                                                              #dropout=self.dropout,
+                                                             #batch_first = True)
+        for name, param in self.gru_decoder.named_parameters():
+            if "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+
+        # Input layers
+        for x in range(nDays):
+            setattr(self, "inpLayer" + str(x), nn.Linear(neural_dim, neural_dim))
+
+        for x in range(nDays):
+            thisLayer = getattr(self, "inpLayer" + str(x))
+            thisLayer.weight = torch.nn.Parameter(
+                thisLayer.weight + torch.eye(neural_dim)
+            )
+
+        # rnn outputs
+        if self.bidirectional:
+            self.fc_decoder_out = nn.Linear(
+                hidden_dim * 2, n_classes + 1
+            )  # +1 for CTC blank
+        else:
+            self.fc_decoder_out = nn.Linear(hidden_dim, n_classes + 1)  # +1 for CTC blank
+
+    def forward(self, neuralInput, dayIdx):
+        neuralInput = torch.permute(neuralInput, (0, 2, 1))
+        neuralInput = self.gaussianSmoother(neuralInput)
+        neuralInput = torch.permute(neuralInput, (0, 2, 1))
+
+        # apply day layer
+        dayWeights = torch.index_select(self.dayWeights, 0, dayIdx)
+        transformedNeural = torch.einsum(
+            "btd,bdk->btk", neuralInput, dayWeights
+        ) + torch.index_select(self.dayBias, 0, dayIdx)
+        transformedNeural = self.inputLayerNonlinearity(transformedNeural)
+
+        # stride/kernel
+        stridedInputs = torch.permute(
+            self.unfolder(
+                torch.unsqueeze(torch.permute(transformedNeural, (0, 2, 1)), 3)
+            ),
+            (0, 2, 1),
+        )
+
+        # apply RNN layer
+        if self.bidirectional:
+            h0 = torch.zeros(
+                self.layer_dim * 2,
+                transformedNeural.size(0),
+                self.hidden_dim,
+                device=self.device,
+            ).requires_grad_()
+        else:
+            h0 = torch.zeros(
+                self.layer_dim,
+                transformedNeural.size(0),
+                self.hidden_dim,
+                device=self.device,
+            ).requires_grad_()
+
+        hid, _ = self.gru_decoder(stridedInputs, h0.detach())
+        hid = self.layer_norm(hid)
+        hid = self.pos_encoder(hid)
+        mask = torch.triu(torch.ones(hid.shape[1], hid.shape[1], dtype=torch.bool, device=self.device),
+                      #diagonal=1)
+        hid = self.transformer_encoder(hid,src_mask = mask)
+        #hid = self.transformer_encoder2(hid, src_mask = mask)
+        
+        # get seq
+        seq_out = self.fc_decoder_out(hid)
+        return seq_out
